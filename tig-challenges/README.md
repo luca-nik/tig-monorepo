@@ -8,6 +8,7 @@ Presently, TIG features the following challenges:
 3. [Knapsack problem](./src/knapsack.md)
 4. [Vector range search](./src/vector_search.md)
 5. [Hypergraph partitioning](./src/hypergraph.md)
+6. [ZK circuit optimization](./src/zk.md)
 
 # License
 

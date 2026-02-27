@@ -26,7 +26,7 @@ bincode = "1.3.3"
 serde_bytes = "0.11.17"
 merlin = "3.0"
 curve25519-dalek = { version = "4.1", features = ["serde"] }
-tig-circuit-tools = { git = "https://github.com/CELtd/tig-circuit-tools", default-features = false }
+tig-circuit-tools = { path = "../../../tig-circuit-tools", default-features = false }
 
 [features]
 cuda = ["cudarc"]

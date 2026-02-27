@@ -412,6 +412,7 @@ pub fn solve_challenge(challenge: &Challenge, optimize: OptimizeCircuitFn) -> Re
 mod tests {
     use super::*;
     use std::time::Instant;
+    use tig_circuit_tools::remove_aliases;
 
     /// Helper: builds a Challenge with a fixed test seed.
     fn make_challenge(delta: usize) -> Challenge {
@@ -604,6 +605,53 @@ mod tests {
         let y_star_pub = &public_io_star[..ch.num_circuit_outputs];
         assert_eq!(y0_pub, y_star_pub, "C0 and C* must produce the same outputs");
         eprintln!("[7/7] output equivalence OK ({} output scalars match)", y0_pub.len());
+
+        eprintln!("=== PASSED in {:.2?} ===\n", total.elapsed());
+    }
+
+    // ----- Integration test: full Spartan prove/verify with alias optimization -----
+
+    #[test]
+    fn test_alias_optimizer_roundtrip() {
+        let total = Instant::now();
+        eprintln!("\n=== Alias Optimizer Roundtrip (delta=1) ===");
+
+        // --- Step 1: generate challenge ---
+        let t0 = Instant::now();
+        let ch = make_challenge(1);
+        eprintln!("[1/4] generate challenge: {} constraints in {:.2?}",
+            ch.circuit_c0.num_cons, t0.elapsed());
+
+        // --- Step 2: define optimizer ---
+        fn alias_optimizer(c0: &Circuit) -> Circuit {
+            let si = c0.to_spartan_instance();
+            let optimized = remove_aliases(&si);
+            Circuit::from_spartan_instance(optimized)
+        }
+
+        // --- Step 3: solve (optimize + witnesses + proofs) ---
+        let t0 = Instant::now();
+        let solution = solve_challenge(&ch, alias_optimizer)
+            .expect("solve_challenge must succeed with alias optimizer");
+        eprintln!("[2/4] solve_challenge: C* has {} constraints (reduced from {}), in {:.2?}",
+            solution.circuit_star.num_cons, ch.circuit_c0.num_cons, t0.elapsed());
+
+        // Sanity: K* < K0
+        assert!(
+            solution.circuit_star.num_cons < ch.circuit_c0.num_cons,
+            "Alias optimizer must reduce constraint count: {} >= {}",
+            solution.circuit_star.num_cons, ch.circuit_c0.num_cons
+        );
+
+        // --- Step 4: verify ---
+        let t0 = Instant::now();
+        ch.verify_solution(&solution)
+            .expect("verify_solution must succeed for alias-optimized circuit");
+        eprintln!("[3/4] verify_solution OK in {:.2?}", t0.elapsed());
+
+        let epsilon = 1.0 - (solution.circuit_star.num_cons as f64 / ch.circuit_c0.num_cons as f64);
+        eprintln!("[4/4] epsilon = {:.4} ({} -> {} constraints)",
+            epsilon, ch.circuit_c0.num_cons, solution.circuit_star.num_cons);
 
         eprintln!("=== PASSED in {:.2?} ===\n", total.elapsed());
     }

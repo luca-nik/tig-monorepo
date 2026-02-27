@@ -2558,7 +2558,6 @@ dependencies = [
 [[package]]
 name = "tig-circuit-tools"
 version = "0.1.0"
-source = "git+https://github.com/CELtd/tig-circuit-tools#dc3960dfddcbcce91d8a8e3840f16912605be371"
 dependencies = [
  "curve25519-dalek",
  "rand",

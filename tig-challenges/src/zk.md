@@ -151,7 +151,7 @@ Verifies a Solution. The verifier recomputes everything it can from the circuit 
 
 | Library | Version | Role |
 |---------|---------|------|
-| tig-circuit-tools | git | Circuit generation, DAG, witness computation, R1CS solver |
+| tig-circuit-tools | git | Circuit generation, DAG, witness computation, R1CS solver, baseline optimizer |
 | libspartan | 0.9.0 | ZK-SNARK proving system for R1CS |
 | curve25519-dalek | 4.1 | Scalar field arithmetic (Curve25519) |
 | merlin | 3.0 | Fiat-Shamir transcript (non-interactive proofs) |
@@ -198,20 +198,24 @@ cargo test --features c007 -p tig-challenges -- --nocapture
 | `test_deterministic_generation` | <1s | Same seed produces byte-identical R1CS matrices |
 | `test_hash_and_xeval_derivation` | <1s | Blake3 hashing is deterministic, x_eval scalars are non-zero |
 | `test_witness_satisfies_c0` | <1s | Witness passes libspartan `is_sat()` check: (A*z)*(B*z) = C*z |
-| `test_full_identity_roundtrip` | ~66s | **Full pipeline**: generate challenge, compute witnesses (DAG for C0, R1CS solver for C*), generate two Spartan SNARK proofs, verify both proofs, check output equivalence |
+| `test_full_identity_roundtrip` | ~66s | **Full pipeline (identity)**: generate challenge, compute witnesses (DAG for C0, R1CS solver for C*), generate two Spartan SNARK proofs, verify both proofs, check output equivalence |
+| `test_alias_optimizer_roundtrip` | ~90s | **Full pipeline (with optimization)**: generate challenge, optimize C0 via `remove_aliases`, compute witnesses, generate proofs, verify K* < K0, verify output equivalence, verify both proofs |
 
 The identity roundtrip test uses C* = C0 (no optimization) to validate the entire pipeline end-to-end. It exercises every component: circuit generation, hash derivation, witness computation via both methods, Spartan proving, Spartan verification, and output equivalence checking. The only check skipped is K* < K0 (since the circuits are identical).
+
+The alias optimizer roundtrip test exercises the **complete challenge flow with actual optimization**. It uses `remove_aliases` (from tig-circuit-tools) to produce a C* with fewer constraints than C0, then runs the full pipeline including the K* < K0 check. This validates that optimized circuits survive the entire proof/verify pipeline and that `solve_witness_from_r1cs` converges on compacted circuits.
 
 ### Performance Profile (delta=1, ~1000 constraints)
 
 | Operation | Time |
 |-----------|------|
 | Circuit generation (DAG + R1CS) | ~10ms |
+| Alias optimization (remove_aliases) | <1ms |
 | Hash derivation + x_eval | <1ms |
 | Witness computation (DAG-based) | <1ms |
 | Witness computation (R1CS solver) | <1ms |
 | Spartan encode + prove (per circuit) | ~30s |
 | Spartan verify (per circuit) | ~2s |
-| **Total (2 proofs + 2 verifications)** | **~66s** |
+| **Total (2 proofs + 2 verifications)** | **~66-90s** |
 
-The bottleneck is Spartan proving (~30s per proof). All other operations are negligible. Verification is ~15x faster than proving.
+The bottleneck is Spartan proving (~30s per proof). All other operations are negligible. Verification is ~15x faster than proving. The alias optimizer roundtrip takes slightly longer (~90s) because the verifier recomputes separate generators and commitments for C0 and C*.

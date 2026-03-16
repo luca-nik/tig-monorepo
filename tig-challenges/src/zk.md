@@ -26,7 +26,7 @@ The ZK Challenge asks participants to **optimize random R1CS circuits**. Given a
   x_eval = Hash-to-Field(Blake3(C0) || Blake3(C*))    <-- anti-grinding: random eval point
 
   C0 witness:  compute_witness(DAG, x_eval)            <-- uses DAG (known to system)
-  C* witness:  solve_witness_from_r1cs(C*, x_eval)     <-- uses R1CS solver (no DAG needed)
+  C* witness:  solve_witness_forward(C*, x_eval)       <-- single forward pass (rows must be in topological order)
 
   pi0    = Spartan.prove(C0, witness_C0)               <-- SNARK proof for baseline
   pi*    = Spartan.prove(C*, witness_C*)               <-- SNARK proof for optimized
@@ -52,10 +52,10 @@ The verifier never re-executes either circuit. Instead, it relies on three crypt
 
 ### What the Participant Receives and Returns
 
-**Input**: `Circuit` struct containing raw R1CS matrices (A, B, C) and dimensions.
+**Input**: `SpartanInstance` from `tig-circuit-tools`, containing raw R1CS matrices (A, B, C) and dimensions.
 
 ```rust
-pub struct Circuit {
+pub struct SpartanInstance {
     pub num_cons: usize,     // number of constraints (rows)
     pub num_vars: usize,     // number of private variables
     pub num_inputs: usize,   // number of public I/O values
@@ -67,13 +67,13 @@ pub struct Circuit {
 
 Each constraint row i encodes: `(A[i] . z) * (B[i] . z) = C[i] . z` where z is the witness vector.
 
-**Output**: An optimized `Circuit` with fewer constraints (`num_cons`) that computes the same function.
+**Output**: An optimized `SpartanInstance` with fewer constraints (`num_cons`) that computes the same function, with rows in **topological evaluation order**.
 
 ```rust
-pub type OptimizeCircuitFn = fn(&Circuit) -> Circuit;
+pub type OptimizeCircuitFn = fn(&SpartanInstance) -> SpartanInstance;
 ```
 
-The participant does NOT need to provide a witness generator. The system computes witnesses automatically using `solve_witness_from_r1cs`, a fixed-point R1CS solver that determines all variable values by iterating over constraints.
+The participant does NOT need to provide a witness generator. The system computes witnesses automatically using `solve_witness_forward`, a single forward-pass solver. **C* rows must be in topological order** — each row may have at most one unknown when reached in sequence. If violated, `solve_challenge` returns an error and the solution is rejected. See the `OptimizeCircuitFn` rustdoc for full details.
 
 ### What Optimizations Are Possible
 
@@ -95,7 +95,7 @@ With default configuration, ~50% of constraints are removable. Advanced optimiza
 pub struct Challenge {
     pub seed: [u8; 32],                // cryptographic seed for circuit generation
     pub difficulty: Difficulty,         // delta (1 = ~1000 constraints)
-    pub circuit_c0: Circuit,           // baseline R1CS circuit
+    pub circuit_c0: SpartanInstance,   // baseline R1CS circuit
     pub num_circuit_inputs: usize,     // number of public input signals
     pub num_circuit_outputs: usize,    // number of public output signals
 }
@@ -105,13 +105,15 @@ pub struct Challenge {
 
 ```rust
 pub struct Solution {
-    pub circuit_star: Circuit,          // optimized circuit C*
+    pub circuit_star: SpartanInstance,  // optimized circuit C* (rows in topological order)
     pub y0_pub: Vec<Scalar>,            // C0 outputs at x_eval
     pub y_star_pub: Vec<Scalar>,        // C* outputs at x_eval
     pub proof0: SNARK,                  // Spartan proof for C0
     pub proof_star: SNARK,              // Spartan proof for C*
 }
 ```
+
+Generators and commitments are NOT part of the Solution — the verifier recomputes them independently from the circuit matrices.
 
 The Solution does not include Spartan generators or commitments. The verifier recomputes these independently from the circuit matrices it already has (C0 from the Challenge, C* from the Solution). This ensures the verifier derives everything it can and only receives what it cannot compute: the proofs, the optimized circuit, and the outputs.
 
@@ -131,7 +133,7 @@ Produces a Solution:
 1. Calls the participant's `optimize()` function: C0 -> C*
 2. Computes anti-grinding hash: `x_eval = Hash-to-Field(Blake3(C0) || Blake3(C*))`
 3. Computes C0 witness via `compute_witness()` (regenerates DAG from seed)
-4. Computes C* witness via `solve_witness_from_r1cs()` (fixed-point R1CS solver)
+4. Computes C* witness via `solve_witness_forward()` (single forward pass — **requires rows in topological order**)
 5. Generates Spartan SNARK proofs for both circuits
 6. Returns Solution with proofs and outputs (no commitments or generators — the verifier recomputes those)
 
@@ -198,12 +200,13 @@ cargo test --features c007 -p tig-challenges -- --nocapture
 | `test_deterministic_generation` | <1s | Same seed produces byte-identical R1CS matrices |
 | `test_hash_and_xeval_derivation` | <1s | Blake3 hashing is deterministic, x_eval scalars are non-zero |
 | `test_witness_satisfies_c0` | <1s | Witness passes libspartan `is_sat()` check: (A*z)*(B*z) = C*z |
-| `test_full_identity_roundtrip` | ~66s | **Full pipeline (identity)**: generate challenge, compute witnesses (DAG for C0, R1CS solver for C*), generate two Spartan SNARK proofs, verify both proofs, check output equivalence |
+| `test_full_identity_roundtrip` | ~66s | **Full pipeline (identity)**: generate challenge, compute witnesses (DAG for C0, forward pass for C*), generate two Spartan SNARK proofs, verify both proofs, check output equivalence |
 | `test_alias_optimizer_roundtrip` | ~90s | **Full pipeline (with optimization)**: generate challenge, optimize C0 via `remove_aliases`, compute witnesses, generate proofs, verify K* < K0, verify output equivalence, verify both proofs |
+| `test_wrong_order_rejected` | <1s | **Rejection test**: reversed circuit rows trigger `NotInEvaluationOrder` immediately at row 0 |
 
 The identity roundtrip test uses C* = C0 (no optimization) to validate the entire pipeline end-to-end. It exercises every component: circuit generation, hash derivation, witness computation via both methods, Spartan proving, Spartan verification, and output equivalence checking. The only check skipped is K* < K0 (since the circuits are identical).
 
-The alias optimizer roundtrip test exercises the **complete challenge flow with actual optimization**. It uses `remove_aliases` (from tig-circuit-tools) to produce a C* with fewer constraints than C0, then runs the full pipeline including the K* < K0 check. This validates that optimized circuits survive the entire proof/verify pipeline and that `solve_witness_from_r1cs` converges on compacted circuits.
+The alias optimizer roundtrip test exercises the **complete challenge flow with actual optimization**. It uses `remove_aliases` (from tig-circuit-tools) to produce a C* with fewer constraints than C0, then runs the full pipeline including the K* < K0 check. This validates that optimized circuits survive the entire proof/verify pipeline and that `solve_witness_forward` succeeds on correctly-ordered compacted circuits.
 
 ### Performance Profile (delta=1, ~1000 constraints)
 

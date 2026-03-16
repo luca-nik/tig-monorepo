@@ -8,7 +8,7 @@ use libspartan::{InputsAssignment, Instance, SNARKGens, VarsAssignment, SNARK};
 use blake3::Hasher as Blake3;
 use merlin::Transcript;
 use tig_circuit_tools::{
-    compute_witness, dag_to_spartan, generate_dag, solve_witness_from_r1cs, CircuitConfig,
+    compute_witness, dag_to_spartan, generate_dag, solve_witness_forward, CircuitConfig,
     SpartanInstance,
 };
 
@@ -16,17 +16,14 @@ use tig_circuit_tools::{
 // Utility: Cryptographic Hashing and Hash-to-Field
 // =============================================================================
 
-/// Sparse R1CS matrix in COO (Coordinate) format.
-pub type R1CSMatrix = Vec<(usize, usize, [u8; 32])>;
-
 /// Cryptographic hash (512-bit) used for anti-grinding commitments.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CryptoHash(#[serde(with = "serde_bytes")] pub [u8; 64]);
 
 impl CryptoHash {
-    /// Hashes a Circuit structure: H(C).
-    pub fn from_circuit(circuit: &Circuit) -> Result<Self> {
-        let bytes = bincode::serialize(circuit)?;
+    /// Hashes a SpartanInstance: H(C).
+    pub fn from_spartan_instance(instance: &SpartanInstance) -> Result<Self> {
+        let bytes = bincode::serialize(instance)?;
         let mut hasher = Blake3::new();
         hasher.update(&bytes);
         let mut hash = [0u8; 64];
@@ -83,63 +80,26 @@ impl From<Difficulty> for Vec<i32> {
     }
 }
 
-/// R1CS circuit representation compatible with libspartan.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[allow(non_snake_case)]
-pub struct Circuit {
-    pub num_cons: usize,
-    pub num_vars: usize,
-    pub num_inputs: usize,
-    pub A: R1CSMatrix,
-    pub B: R1CSMatrix,
-    pub C: R1CSMatrix,
-}
-
-impl Circuit {
-    /// Constructs a local Circuit from a tig-circuit-tools SpartanInstance.
-    fn from_spartan_instance(si: tig_circuit_tools::SpartanInstance) -> Self {
-        Circuit {
-            num_cons: si.num_cons,
-            num_vars: si.num_vars,
-            num_inputs: si.num_inputs,
-            A: si.A,
-            B: si.B,
-            C: si.C,
-        }
-    }
-
-    fn num_non_zero(&self) -> usize {
-        self.A.len().max(self.B.len()).max(self.C.len())
-    }
-
-    fn to_spartan_instance(&self) -> SpartanInstance {
-        SpartanInstance {
-            num_cons: self.num_cons,
-            num_vars: self.num_vars,
-            num_inputs: self.num_inputs,
-            A: self.A.clone(),
-            B: self.B.clone(),
-            C: self.C.clone(),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Challenge {
     pub seed: [u8; 32],
     pub difficulty: Difficulty,
-    pub circuit_c0: Circuit,
+    pub circuit_c0: SpartanInstance,
     pub num_circuit_inputs: usize,
     pub num_circuit_outputs: usize,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Solution {
-    pub circuit_star: Circuit,
+    pub circuit_star: SpartanInstance,
     pub y0_pub: Vec<Scalar>,
     pub y_star_pub: Vec<Scalar>,
     pub proof0: SNARK,
     pub proof_star: SNARK,
+}
+
+fn num_non_zero(si: &SpartanInstance) -> usize {
+    si.A.len().max(si.B.len()).max(si.C.len())
 }
 
 // =============================================================================
@@ -148,10 +108,53 @@ pub struct Solution {
 
 /// Callback signature for the participant's circuit optimizer.
 ///
-/// Takes the baseline circuit C⁰ and returns C* — an optimized circuit with
-/// fewer constraints. Witness generation is handled automatically by
-/// `solve_witness_from_r1cs` (fixed-point R1CS solver).
-pub type OptimizeCircuitFn = fn(&Circuit) -> Circuit;
+/// Takes the baseline circuit C⁰ (as a [`SpartanInstance`]) and returns C* —
+/// an optimized circuit with strictly fewer constraints that computes the same
+/// function.
+///
+/// # Requirements
+///
+/// ## 1. Fewer constraints
+/// `C*.num_cons` must be strictly less than `C⁰.num_cons`. Solutions where
+/// `K* >= K⁰` are immediately rejected by the verifier.
+///
+/// ## 2. Functional equivalence
+/// C* must compute the same function as C⁰: for the evaluation point `x_eval`
+/// derived from `H(C⁰) || H(C*)`, both circuits must produce identical public
+/// outputs.
+///
+/// ## 3. Topological evaluation order (CRITICAL)
+/// **Constraint rows in C* must be in topological evaluation order.**
+///
+/// Specifically: when the witness solver processes row `i` (scanning from row 0
+/// to row `num_cons - 1`), every variable appearing in the A and B matrices of
+/// that row must either be a known circuit input or have already been determined
+/// by a previous row `j < i`. At most one variable may be unknown — the one
+/// this row computes (its output, appearing in C).
+///
+/// The witness solver performs a **single forward pass** with no backtracking.
+/// If row `i` has more than one unknown variable, `solve_challenge` immediately
+/// returns an error and the solution is rejected. The full burden of correct
+/// ordering lies with the challenger.
+///
+/// ### Why this is not a burden in practice
+/// C⁰ is generated by `dag_to_spartan` which already emits rows in topological
+/// order (deepest dependencies first, outputs last). Any optimizer that starts
+/// from C⁰ and only removes or merges constraints — without introducing new
+/// dependencies — naturally preserves this order. If your optimizer restructures
+/// the circuit, emit rows such that a row producing variable `v` always appears
+/// before any row that consumes `v` in its A or B matrices.
+///
+/// # Example
+/// ```rust
+/// use tig_circuit_tools::{SpartanInstance, remove_aliases};
+///
+/// fn optimize(c0: &SpartanInstance) -> SpartanInstance {
+///     // remove_aliases preserves topological order by construction
+///     remove_aliases(c0)
+/// }
+/// ```
+pub type OptimizeCircuitFn = fn(&SpartanInstance) -> SpartanInstance;
 
 // =============================================================================
 // Helper: seed bytes to hex string
@@ -179,12 +182,11 @@ impl Challenge {
 
         let num_circuit_inputs = dag.num_inputs;
         let num_circuit_outputs = dag.num_outputs;
-        let circuit_c0 = Circuit::from_spartan_instance(spartan_inst);
 
         Ok(Challenge {
             seed: *seed,
             difficulty: difficulty.clone(),
-            circuit_c0,
+            circuit_c0: spartan_inst,
             num_circuit_inputs,
             num_circuit_outputs,
         })
@@ -203,8 +205,8 @@ impl Challenge {
     /// 4. π* verifies against C* with public I/O [y_star_pub..., x_eval...]
     pub fn verify_solution(&self, solution: &Solution) -> Result<()> {
         // 1. Compute hashes and derive evaluation point
-        let h0 = CryptoHash::from_circuit(&self.circuit_c0)?;
-        let h_star = CryptoHash::from_circuit(&solution.circuit_star)?;
+        let h0 = CryptoHash::from_spartan_instance(&self.circuit_c0)?;
+        let h_star = CryptoHash::from_spartan_instance(&solution.circuit_star)?;
         let combined_hash = h0.combine(&h_star);
         let x_eval = combined_hash.to_scalars(self.num_circuit_inputs);
 
@@ -231,7 +233,7 @@ impl Challenge {
         )
         .map_err(|e| anyhow!("Failed to create Spartan Instance for C⁰: {:?}", e))?;
         let gens0 = SNARKGens::new(
-            c0.num_cons, c0.num_vars, c0.num_inputs, c0.num_non_zero(),
+            c0.num_cons, c0.num_vars, c0.num_inputs, num_non_zero(c0),
         );
         let (comm0, _) = SNARK::encode(&inst0, &gens0);
 
@@ -249,14 +251,14 @@ impl Challenge {
             .map_err(|e| anyhow!("Proof π⁰ verification failed: {:?}", e))?;
 
         // 6. Recompute Spartan instance, generators, and commitment for C*
-        let c_star = &solution.circuit_star;
+        let cs = &solution.circuit_star;
         let inst_star = Instance::new(
-            c_star.num_cons, c_star.num_vars, c_star.num_inputs,
-            &c_star.A, &c_star.B, &c_star.C,
+            cs.num_cons, cs.num_vars, cs.num_inputs,
+            &cs.A, &cs.B, &cs.C,
         )
         .map_err(|e| anyhow!("Failed to create Spartan Instance for C*: {:?}", e))?;
         let gens_star = SNARKGens::new(
-            c_star.num_cons, c_star.num_vars, c_star.num_inputs, c_star.num_non_zero(),
+            cs.num_cons, cs.num_vars, cs.num_inputs, num_non_zero(cs),
         );
         let (comm_star, _) = SNARK::encode(&inst_star, &gens_star);
 
@@ -286,15 +288,16 @@ impl Challenge {
 /// 1. Calls `optimize` to produce C*.
 /// 2. Derives x_eval from H(C⁰) || H(C*) (anti-grinding).
 /// 3. Regenerates the DAG and computes the C⁰ witness via `compute_witness`.
-/// 4. Computes the C* witness via `solve_witness_from_r1cs` (fixed-point R1CS solver).
+/// 4. Computes the C* witness via `solve_witness_forward` (single forward pass).
+///    Fails immediately if C* rows are not in topological evaluation order.
 /// 5. Generates Spartan SNARK proofs π⁰ and π*.
 pub fn solve_challenge(challenge: &Challenge, optimize: OptimizeCircuitFn) -> Result<Solution> {
     // 1. Participant optimizes C⁰ → C*
     let circuit_star = optimize(&challenge.circuit_c0);
 
     // 2. Compute hashes
-    let h0 = CryptoHash::from_circuit(&challenge.circuit_c0)?;
-    let h_star = CryptoHash::from_circuit(&circuit_star)?;
+    let h0 = CryptoHash::from_spartan_instance(&challenge.circuit_c0)?;
+    let h_star = CryptoHash::from_spartan_instance(&circuit_star)?;
 
     // 3. Derive evaluation point x_eval = Hash-to-Field(H(C⁰) || H(C*))
     let combined_hash = h0.combine(&h_star);
@@ -307,30 +310,25 @@ pub fn solve_challenge(challenge: &Challenge, optimize: OptimizeCircuitFn) -> Re
     let (vars0, public_io0) = compute_witness(&dag, &x_eval);
     // public_io0 = [y0_out_0, ..., y0_out_n, x_eval_0, ..., x_eval_m]
 
-    // 5. Compute witness for C* using fixed-point R1CS solver
-    let (vars_star, public_io_star) = solve_witness_from_r1cs(
-        &circuit_star.to_spartan_instance(),
+    // 5. Compute witness for C* using single forward pass.
+    // C* rows must be in topological evaluation order — see OptimizeCircuitFn docs.
+    let (vars_star, public_io_star) = solve_witness_forward(
+        &circuit_star,
         challenge.num_circuit_outputs,
         &x_eval,
     )
     .map_err(|e| anyhow!("C* witness solver failed: {:?}", e))?;
 
     // 6. Generate Spartan proof for C⁰
+    let c0 = &challenge.circuit_c0;
     let inst0 = Instance::new(
-        challenge.circuit_c0.num_cons,
-        challenge.circuit_c0.num_vars,
-        challenge.circuit_c0.num_inputs,
-        &challenge.circuit_c0.A,
-        &challenge.circuit_c0.B,
-        &challenge.circuit_c0.C,
+        c0.num_cons, c0.num_vars, c0.num_inputs,
+        &c0.A, &c0.B, &c0.C,
     )
     .map_err(|e| anyhow!("Failed to create Spartan Instance for C⁰: {:?}", e))?;
 
     let gens0 = SNARKGens::new(
-        challenge.circuit_c0.num_cons,
-        challenge.circuit_c0.num_vars,
-        challenge.circuit_c0.num_inputs,
-        challenge.circuit_c0.num_non_zero(),
+        c0.num_cons, c0.num_vars, c0.num_inputs, num_non_zero(c0),
     );
 
     let (comm0, decomm0) = SNARK::encode(&inst0, &gens0);
@@ -355,20 +353,14 @@ pub fn solve_challenge(challenge: &Challenge, optimize: OptimizeCircuitFn) -> Re
 
     // 7. Generate Spartan proof for C*
     let inst_star = Instance::new(
-        circuit_star.num_cons,
-        circuit_star.num_vars,
-        circuit_star.num_inputs,
-        &circuit_star.A,
-        &circuit_star.B,
-        &circuit_star.C,
+        circuit_star.num_cons, circuit_star.num_vars, circuit_star.num_inputs,
+        &circuit_star.A, &circuit_star.B, &circuit_star.C,
     )
     .map_err(|e| anyhow!("Failed to create Spartan Instance for C*: {:?}", e))?;
 
     let gens_star = SNARKGens::new(
-        circuit_star.num_cons,
-        circuit_star.num_vars,
-        circuit_star.num_inputs,
-        circuit_star.num_non_zero(),
+        circuit_star.num_cons, circuit_star.num_vars, circuit_star.num_inputs,
+        num_non_zero(&circuit_star),
     );
 
     let (comm_star, decomm_star) = SNARK::encode(&inst_star, &gens_star);
@@ -454,9 +446,9 @@ mod tests {
     fn test_hash_and_xeval_derivation() {
         let ch = make_challenge(1);
         let t0 = Instant::now();
-        let h0 = CryptoHash::from_circuit(&ch.circuit_c0).unwrap();
+        let h0 = CryptoHash::from_spartan_instance(&ch.circuit_c0).unwrap();
         let hash_time = t0.elapsed();
-        let h0_again = CryptoHash::from_circuit(&ch.circuit_c0).unwrap();
+        let h0_again = CryptoHash::from_spartan_instance(&ch.circuit_c0).unwrap();
         assert_eq!(h0, h0_again, "Hashing must be deterministic");
 
         let combined = h0.combine(&h0_again);
@@ -474,7 +466,7 @@ mod tests {
         let ch = make_challenge(1);
         let c0 = &ch.circuit_c0;
 
-        let h0 = CryptoHash::from_circuit(c0).unwrap();
+        let h0 = CryptoHash::from_spartan_instance(c0).unwrap();
         let x_eval = h0.combine(&h0).to_scalars(ch.num_circuit_inputs);
 
         let t0 = Instant::now();
@@ -522,7 +514,7 @@ mod tests {
 
         // --- Step 2: hash derivation & x_eval ---
         let t0 = Instant::now();
-        let h0 = CryptoHash::from_circuit(c0).unwrap();
+        let h0 = CryptoHash::from_spartan_instance(c0).unwrap();
         let h_star = h0.clone();
         let x_eval = h0.combine(&h_star).to_scalars(ch.num_circuit_inputs);
         eprintln!("[2/7] hash + x_eval derivation ({} scalars) in {:.2?}", x_eval.len(), t0.elapsed());
@@ -539,7 +531,7 @@ mod tests {
         let t0 = Instant::now();
         let inst0 = Instance::new(c0.num_cons, c0.num_vars, c0.num_inputs, &c0.A, &c0.B, &c0.C)
             .unwrap();
-        let gens0 = SNARKGens::new(c0.num_cons, c0.num_vars, c0.num_inputs, c0.num_non_zero());
+        let gens0 = SNARKGens::new(c0.num_cons, c0.num_vars, c0.num_inputs, num_non_zero(c0));
         let (comm0, decomm0) = SNARK::encode(&inst0, &gens0);
         let encode_time = t0.elapsed();
 
@@ -562,18 +554,18 @@ mod tests {
             .expect("pi0 verification must succeed");
         eprintln!("[5/7] verify pi0 in {:.2?}", t0.elapsed());
 
-        // --- Step 6: encode + prove + verify π* (C* = C⁰ identity, witness via R1CS solver) ---
+        // --- Step 6: encode + prove + verify π* (C* = C⁰ identity, witness via forward pass) ---
         let t0 = Instant::now();
-        let (vars_star, public_io_star) = solve_witness_from_r1cs(
-            &c0.to_spartan_instance(),
+        let (vars_star, public_io_star) = solve_witness_forward(
+            c0,
             ch.num_circuit_outputs,
             &x_eval,
         )
-        .expect("R1CS solver must succeed for identity circuit");
+        .expect("forward witness solver must succeed for identity circuit");
         let inst_star =
             Instance::new(c0.num_cons, c0.num_vars, c0.num_inputs, &c0.A, &c0.B, &c0.C).unwrap();
         let gens_star =
-            SNARKGens::new(c0.num_cons, c0.num_vars, c0.num_inputs, c0.num_non_zero());
+            SNARKGens::new(c0.num_cons, c0.num_vars, c0.num_inputs, num_non_zero(c0));
         let (comm_star, decomm_star) = SNARK::encode(&inst_star, &gens_star);
 
         let vs_bytes: Vec<[u8; 32]> = vars_star.iter().map(|s| s.to_bytes()).collect();
@@ -623,10 +615,8 @@ mod tests {
             ch.circuit_c0.num_cons, t0.elapsed());
 
         // --- Step 2: define optimizer ---
-        fn alias_optimizer(c0: &Circuit) -> Circuit {
-            let si = c0.to_spartan_instance();
-            let optimized = remove_aliases(&si);
-            Circuit::from_spartan_instance(optimized)
+        fn alias_optimizer(c0: &SpartanInstance) -> SpartanInstance {
+            remove_aliases(c0)
         }
 
         // --- Step 3: solve (optimize + witnesses + proofs) ---
@@ -654,5 +644,45 @@ mod tests {
             epsilon, ch.circuit_c0.num_cons, solution.circuit_star.num_cons);
 
         eprintln!("=== PASSED in {:.2?} ===\n", total.elapsed());
+    }
+
+    // ----- Negative test: wrong evaluation order is rejected -----
+
+    #[test]
+    fn test_wrong_order_rejected() {
+        use tig_circuit_tools::{solve_witness_forward, WitnessError};
+
+        let ch = make_challenge(1);
+        let c0 = &ch.circuit_c0;
+
+        // Build a deliberately reversed circuit: flip all row indices in A, B, C.
+        // Row 0 becomes row (num_cons-1) and vice versa — the output constraints
+        // (which depend on all intermediates) now come first, guaranteeing multiple
+        // unknowns on the very first row of the forward pass.
+        let num_cons = c0.num_cons;
+        let flip = |mat: &tig_circuit_tools::R1CSMatrix| -> tig_circuit_tools::R1CSMatrix {
+            mat.iter().map(|&(row, col, val)| (num_cons - 1 - row, col, val)).collect()
+        };
+
+        let reversed = SpartanInstance {
+            num_cons: c0.num_cons,
+            num_vars: c0.num_vars,
+            num_inputs: c0.num_inputs,
+            A: flip(&c0.A),
+            B: flip(&c0.B),
+            C: flip(&c0.C),
+        };
+
+        // Derive any valid x_eval (value doesn't matter — we expect an order error)
+        let h0 = CryptoHash::from_spartan_instance(c0).unwrap();
+        let x_eval = h0.combine(&h0).to_scalars(ch.num_circuit_inputs);
+
+        let result = solve_witness_forward(&reversed, ch.num_circuit_outputs, &x_eval);
+
+        assert!(
+            matches!(result, Err(WitnessError::NotInEvaluationOrder { .. })),
+            "Expected NotInEvaluationOrder, got: {:?}", result
+        );
+        eprintln!("[wrong_order] correctly rejected reversed circuit: {:?}", result.unwrap_err());
     }
 }

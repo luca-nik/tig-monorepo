@@ -13,9 +13,9 @@ The ZK Challenge asks participants to **optimize random R1CS circuits**. Given a
 ```
                         INSTANCE GENERATION
                         ===================
-  seed + difficulty --> tig-circuit-tools --> DAG --> R1CS matrices (A, B, C) = C0
-                                                     ~1000 constraints at delta=1
-                                                     ~50% are intentionally removable
+  seed + difficulty --> zk::dag (generate_dag) --> DAG --> R1CS matrices (A, B, C) = C0
+                                                          ~1000 constraints at delta=1
+                                                          ~50% are intentionally removable
 
                         PARTICIPANT (SOLVER)
                         ====================
@@ -52,7 +52,7 @@ The verifier never re-executes either circuit. Instead, it relies on three crypt
 
 ### What the Participant Receives and Returns
 
-**Input**: `SpartanInstance` from `tig-circuit-tools`, containing raw R1CS matrices (A, B, C) and dimensions.
+**Input**: `SpartanInstance` (defined in `tig-challenges::zk::r1cs`), containing raw R1CS matrices (A, B, C) and dimensions.
 
 ```rust
 pub struct SpartanInstance {
@@ -123,8 +123,8 @@ The Solution does not include Spartan generators or commitments. The verifier re
 
 Generates a random challenge:
 1. Converts seed to hex string
-2. Calls `tig-circuit-tools::generate_dag()` to build a random computation graph
-3. Converts DAG to Spartan R1CS via `dag_to_spartan()`
+2. Calls `dag::generate_dag()` to build a random computation graph (SHA256 seed → ChaCha20 → backward BFS DAG)
+3. Converts DAG to Spartan R1CS via `r1cs::dag_to_spartan()`
 4. Returns Challenge with the baseline circuit C0
 
 ### `solve_challenge(challenge, optimize)`
@@ -153,11 +153,13 @@ Verifies a Solution. The verifier recomputes everything it can from the circuit 
 
 | Library | Version | Role |
 |---------|---------|------|
-| tig-circuit-tools | git | Circuit generation, DAG, witness computation, R1CS solver, baseline optimizer |
 | libspartan | 0.9.0 | ZK-SNARK proving system for R1CS |
 | curve25519-dalek | 4.1 | Scalar field arithmetic (Curve25519) |
+| rand_chacha | 0.3 | Deterministic ChaCha20 PRNG for DAG generation |
+| sha2 | 0.10 | SHA256 seed hashing for PRNG initialization |
 | merlin | 3.0 | Fiat-Shamir transcript (non-interactive proofs) |
 | blake3 | 1.5.4 | Circuit hashing (anti-grinding commitment) |
+| bincode | 1.3 | Circuit serialization for hashing |
 
 ## R1CS Background
 
@@ -206,7 +208,7 @@ cargo test --features c007 -p tig-challenges -- --nocapture
 
 The identity roundtrip test uses C* = C0 (no optimization) to validate the entire pipeline end-to-end. It exercises every component: circuit generation, hash derivation, witness computation via both methods, Spartan proving, Spartan verification, and output equivalence checking. The only check skipped is K* < K0 (since the circuits are identical).
 
-The alias optimizer roundtrip test exercises the **complete challenge flow with actual optimization**. It uses `remove_aliases` (from tig-circuit-tools) to produce a C* with fewer constraints than C0, then runs the full pipeline including the K* < K0 check. This validates that optimized circuits survive the entire proof/verify pipeline and that `solve_witness_forward` succeeds on correctly-ordered compacted circuits.
+The alias optimizer roundtrip test exercises the **complete challenge flow with actual optimization**. It uses `remove_aliases` (from `baselines`) to produce a C* with fewer constraints than C0, then runs the full pipeline including the K* < K0 check. This validates that optimized circuits survive the entire proof/verify pipeline and that `solve_witness_forward` succeeds on correctly-ordered compacted circuits.
 
 ### Performance Profile (delta=1, ~1000 constraints)
 

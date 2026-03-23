@@ -2547,24 +2547,13 @@ dependencies = [
  "merlin",
  "ndarray",
  "rand",
+ "rand_chacha",
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2",
  "spartan",
  "statrs",
- "tig-circuit-tools",
-]
-
-[[package]]
-name = "tig-circuit-tools"
-version = "0.1.0"
-dependencies = [
- "curve25519-dalek",
- "rand",
- "rand_chacha",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

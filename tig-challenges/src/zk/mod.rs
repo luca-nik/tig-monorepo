@@ -448,6 +448,36 @@ mod tests {
     }
 
     #[test]
+    fn test_alias_and_scale_optimizer_roundtrip() {
+        let total = Instant::now();
+        eprintln!("\n=== Alias+Scale Optimizer Roundtrip (delta=1) ===");
+
+        let ch = make_challenge(1);
+        eprintln!("[1] baseline: {} constraints", ch.circuit_c0.num_cons);
+
+        fn optimizer(c0: &SpartanInstance) -> SpartanInstance {
+            baselines::remove_aliases_and_scales(c0)
+        }
+
+        let t0 = Instant::now();
+        let solution = solve_challenge(&ch, optimizer).expect("solve_challenge must succeed");
+        eprintln!(
+            "[2] solve: {} -> {} constraints in {:.2?}",
+            ch.circuit_c0.num_cons, solution.circuit_star.num_cons, t0.elapsed()
+        );
+
+        assert!(solution.circuit_star.num_cons < ch.circuit_c0.num_cons);
+
+        let t0 = Instant::now();
+        ch.verify_solution(&solution).expect("verify_solution must succeed");
+        eprintln!("[3] verify OK in {:.2?}", t0.elapsed());
+
+        let eps = 1.0 - solution.circuit_star.num_cons as f64 / ch.circuit_c0.num_cons as f64;
+        eprintln!("[4] epsilon = {:.4}", eps);
+        eprintln!("=== PASSED in {:.2?} ===\n", total.elapsed());
+    }
+
+    #[test]
     fn test_wrong_order_rejected() {
         let ch = make_challenge(1);
         let c0 = &ch.circuit_c0;

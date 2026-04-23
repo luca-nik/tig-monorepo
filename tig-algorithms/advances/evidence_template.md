@@ -52,7 +52,7 @@ WHEN PROVIDING EVIDENCE, YOU MAY CITE LINKS TO EXTERNAL DATA SOURCES.
 
 PLEASE IDENTIFY WHICH TIG CHALLENGE THE METHOD ADDRESSES.
 
-> YOUR RESPONSE HERE (options are satisfiability, vehicle_routing, knapsack, vector_search, or hypergraph)
+> YOUR RESPONSE HERE (options are satisfiability, vehicle_routing, knapsack, vector_search, hypergraph, neuralnet_optimizer, job_scheduling, energy_arbitrage, zk_optimization)
 
 PLEASE DESCRIBE THE METHOD THAT YOU HAVE SELECTED FOR ASSESSMENT.
 

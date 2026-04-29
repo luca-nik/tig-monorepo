@@ -491,6 +491,7 @@ mod tests {
             num_cons: c0.num_cons,
             num_vars: c0.num_vars,
             num_inputs: c0.num_inputs,
+            num_outputs: c0.num_outputs,
             A: flip(&c0.A),
             B: flip(&c0.B),
             C: flip(&c0.C),

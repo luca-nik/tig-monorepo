@@ -237,7 +237,8 @@ pub use fast_lane_v4 as c002_a103;
 
 // c002_a106
 
-// c002_a107
+pub mod fast_lane_v5;
+pub use fast_lane_v5 as c002_a107;
 
 // c002_a108
 

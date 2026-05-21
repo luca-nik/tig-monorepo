@@ -52,7 +52,8 @@ pub use sigma_freud_v6 as c005_a019;
 pub mod sigma_freud_v7;
 pub use sigma_freud_v7 as c005_a022;
 
-// c005_a023
+pub mod hyper_opt_extrem_v3;
+pub use hyper_opt_extrem_v3 as c005_a023;
 
 // c005_a024
 

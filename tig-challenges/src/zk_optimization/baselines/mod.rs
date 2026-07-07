@@ -453,7 +453,7 @@ mod tests {
     use super::*;
     use crate::zk_optimization::{
         crypto::CryptoHash,
-        r1cs::{solve_witness_forward, solve_witness_from_r1cs},
+        r1cs::solve_witness_forward,
         Challenge, Track,
     };
 
@@ -554,45 +554,6 @@ mod tests {
             "[stress_aliases] All {} iterations passed successfully",
             num_iterations
         );
-    }
-
-    #[test]
-    fn test_debug_iteration_14() {
-        let seed = [
-            0u8, 0u8, 0u8, 14u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
-            0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
-        ];
-
-        let ch = Challenge::generate_instance(&seed, &Track { delta: 1 }).unwrap();
-        eprintln!(
-            "[debug] C0: {} cons, {} vars, {} pub_io, {} outputs",
-            ch.circuit_c0.num_cons,
-            ch.circuit_c0.num_vars,
-            ch.circuit_c0.num_inputs,
-            ch.circuit_c0.num_outputs
-        );
-
-        let result = remove_aliases(&ch.circuit_c0);
-        eprintln!(
-            "[debug] After remove_aliases: {} cons, {} vars, {} outputs",
-            result.num_cons, result.num_vars, result.num_outputs
-        );
-
-        let h0 = CryptoHash::from_serializable(&ch.circuit_c0).unwrap();
-        let x_eval = h0.combine(&h0).to_scalars(ch.num_circuit_inputs);
-
-        match solve_witness_forward(&result, ch.num_circuit_outputs, &x_eval) {
-            Ok(_) => eprintln!("[debug] Witness solver succeeded"),
-            Err(e) => {
-                eprintln!("[debug] Witness solver FAILED: {:?}", e);
-
-                // Try the fixed-point solver instead
-                match solve_witness_from_r1cs(&result, ch.num_circuit_outputs, &x_eval) {
-                    Ok(_) => eprintln!("[debug] Fixed-point solver succeeded (row order issue)"),
-                    Err(e2) => eprintln!("[debug] Fixed-point solver ALSO failed: {:?}", e2),
-                }
-            }
-        }
     }
 
     #[test]

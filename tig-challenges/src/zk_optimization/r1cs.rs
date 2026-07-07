@@ -21,6 +21,16 @@ pub enum WitnessError {
     /// Row `row` has more than one unknown variable in the forward pass.
     /// The circuit rows are not in topological evaluation order.
     NotInEvaluationOrder { row: usize },
+    /// Row `row` defines its single unknown non-linearly: the unknown appears
+    /// with non-zero coefficient in **both** A and B, so the constraint is
+    /// quadratic in that variable and does not pin a unique value. A circuit
+    /// containing such a row is not a function of its inputs.
+    NonLinearUnknown { row: usize },
+    /// The R1CS instance is structurally malformed or out of range. Every field
+    /// of a prover-supplied C* is untrusted, so dimension inconsistencies,
+    /// out-of-range row/col indices, or non-canonical scalars are rejected here
+    /// rather than panicking during indexing/allocation downstream.
+    MalformedInstance { reason: &'static str },
 }
 
 /// Sparse R1CS instance for libspartan.
@@ -320,6 +330,9 @@ pub fn solve_witness_forward(
     num_outputs: usize,
     circuit_inputs: &[Scalar],
 ) -> Result<(Vec<Scalar>, Vec<Scalar>), WitnessError> {
+    // Validate the untrusted C* before the `num_inputs - num_outputs`
+    // subtraction below and before any allocation/indexing.
+    validate_instance(instance)?;
     let expected = instance.num_inputs - num_outputs;
     if circuit_inputs.len() != expected {
         return Err(WitnessError::InvalidInputs {
@@ -376,6 +389,15 @@ pub fn solve_witness_forward(
         let (b_known, b_j) = accumulate(&b_rows[row], j, &z);
         let (c_known, c_j) = accumulate(&c_rows[row], j, &z);
 
+        // A defining row must be linear in its single unknown: the unknown may
+        // appear in at most one of {A, B} (it may also appear in C). If it
+        // appears in both A and B the constraint is quadratic in z[j] — it does
+        // not pin a unique value, so C* would not be a function, and the linear
+        // solve below would silently produce an incorrect value. Reject it.
+        if a_j != Scalar::ZERO && b_j != Scalar::ZERO {
+            return Err(WitnessError::NonLinearUnknown { row });
+        }
+
         let denom = a_j * b_known + b_j * a_known - c_j;
         if denom == Scalar::ZERO {
             continue;
@@ -389,93 +411,66 @@ pub fn solve_witness_forward(
 }
 
 // =============================================================================
-// solve_witness_from_r1cs (fixed-point, for debugging)
-// =============================================================================
-
-/// Computes the witness via fixed-point iteration — works with rows in any order.
-///
-/// O(n²) worst case. Use for debugging or when row order is unknown.
-pub fn solve_witness_from_r1cs(
-    instance: &SpartanInstance,
-    num_outputs: usize,
-    circuit_inputs: &[Scalar],
-) -> Result<(Vec<Scalar>, Vec<Scalar>), WitnessError> {
-    let expected = instance.num_inputs - num_outputs;
-    if circuit_inputs.len() != expected {
-        return Err(WitnessError::InvalidInputs {
-            expected,
-            got: circuit_inputs.len(),
-        });
-    }
-
-    let (a_rows, b_rows, c_rows) = build_row_views(instance);
-
-    let z_len = instance.num_vars + 1 + instance.num_inputs;
-    let mut z = vec![Scalar::ZERO; z_len];
-    let mut solved = vec![false; z_len];
-
-    z[instance.num_vars] = Scalar::ONE;
-    solved[instance.num_vars] = true;
-    for (i, &val) in circuit_inputs.iter().enumerate() {
-        let idx = instance.num_vars + 1 + num_outputs + i;
-        z[idx] = val;
-        solved[idx] = true;
-    }
-
-    loop {
-        let mut progress = false;
-
-        for row in 0..instance.num_cons {
-            let mut unsolved_col: Option<usize> = None;
-            let mut multi = false;
-
-            for &(col, _) in a_rows[row]
-                .iter()
-                .chain(b_rows[row].iter())
-                .chain(c_rows[row].iter())
-            {
-                if !solved[col] {
-                    match unsolved_col {
-                        None => unsolved_col = Some(col),
-                        Some(prev) if prev == col => {}
-                        Some(_) => {
-                            multi = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if multi || unsolved_col.is_none() {
-                continue;
-            }
-            let j = unsolved_col.unwrap();
-
-            let (a_known, a_j) = accumulate(&a_rows[row], j, &z);
-            let (b_known, b_j) = accumulate(&b_rows[row], j, &z);
-            let (c_known, c_j) = accumulate(&c_rows[row], j, &z);
-
-            let denom = a_j * b_known + b_j * a_known - c_j;
-            if denom == Scalar::ZERO {
-                continue;
-            }
-            z[j] = (c_known - a_known * b_known) * denom.invert();
-            solved[j] = true;
-            progress = true;
-        }
-
-        if !progress {
-            break;
-        }
-    }
-
-    check_convergence(&solved, instance.num_vars, num_outputs, instance.num_vars)?;
-    Ok(extract_result(&z, instance))
-}
-
-// =============================================================================
 // Helpers
 // =============================================================================
+
+/// Validates an untrusted `SpartanInstance` before any indexing or allocation
+/// derived from its fields.
+///
+/// Every field of a prover-supplied C* is attacker-controlled, so the cheap
+/// structural checks below must hold before `build_row_views` / `accumulate` /
+/// `dot` can index safely — otherwise a malformed C* panics or OOMs the
+/// verifier instead of being rejected. Called at the entry of
+/// [`solve_witness_forward`] and [`satisfies`].
+///
+/// `num_cons` itself is intentionally NOT bounded here: the verifier bounds it
+/// via its `K* < K0` check before the function-check ever runs.
+pub(crate) fn validate_instance(instance: &SpartanInstance) -> Result<(), WitnessError> {
+    // Guards the `num_inputs - num_outputs` subtraction performed in the solver
+    // and in the verifier.
+    if instance.num_inputs < instance.num_outputs {
+        return Err(WitnessError::MalformedInstance {
+            reason: "num_inputs < num_outputs",
+        });
+    }
+    // In a triangular R1CS every private variable needs its own defining row,
+    // so num_vars <= num_cons holds for any circuit that could pass the
+    // function-check. This never rejects a valid circuit and bounds the z
+    // allocation (num_cons is itself bounded by the verifier's K* < K0 check).
+    if instance.num_vars > instance.num_cons {
+        return Err(WitnessError::MalformedInstance {
+            reason: "num_vars > num_cons",
+        });
+    }
+    // Checked arithmetic so the z-vector length cannot overflow into a giant
+    // allocation (which would abort/OOM instead of erroring).
+    let z_len = instance
+        .num_vars
+        .checked_add(1)
+        .and_then(|x| x.checked_add(instance.num_inputs))
+        .ok_or(WitnessError::MalformedInstance {
+            reason: "dimension overflow",
+        })?;
+
+    // Every (row, col, scalar) must be in range and canonical. After this pass,
+    // the `.unwrap()`s and `a_rows[row]` indexing in `build_row_views` are sound.
+    for &(row, col, bytes) in instance
+        .A
+        .iter()
+        .chain(instance.B.iter())
+        .chain(instance.C.iter())
+    {
+        if row >= instance.num_cons
+            || col >= z_len
+            || !bool::from(Scalar::from_canonical_bytes(bytes).is_some())
+        {
+            return Err(WitnessError::MalformedInstance {
+                reason: "row/col out of range or non-canonical scalar",
+            });
+        }
+    }
+    Ok(())
+}
 
 fn build_row_views(
     instance: &SpartanInstance,
@@ -484,6 +479,9 @@ fn build_row_views(
     Vec<Vec<(usize, Scalar)>>,
     Vec<Vec<(usize, Scalar)>>,
 ) {
+    // Precondition: `validate_instance(instance)` has already run, so every row
+    // index is < num_cons and every scalar is canonical — the `a_rows[row]`
+    // indexing below and the `from_canonical_bytes(...).unwrap()` cannot panic.
     let mut a_rows = vec![Vec::new(); instance.num_cons];
     let mut b_rows = vec![Vec::new(); instance.num_cons];
     let mut c_rows = vec![Vec::new(); instance.num_cons];
@@ -547,4 +545,44 @@ fn extract_result(z: &[Scalar], instance: &SpartanInstance) -> (Vec<Scalar>, Vec
     let vars = z[..instance.num_vars].to_vec();
     let public_io = z[instance.num_vars + 1..instance.num_vars + 1 + instance.num_inputs].to_vec();
     (vars, public_io)
+}
+
+/// Inner product of a sparse row with the assignment `z`.
+fn dot(row: &[(usize, Scalar)], z: &[Scalar]) -> Scalar {
+    let mut acc = Scalar::ZERO;
+    for &(col, val) in row {
+        acc += val * z[col];
+    }
+    acc
+}
+
+/// Checks that a full assignment satisfies every R1CS constraint:
+/// `<A[i],z> * <B[i],z> = <C[i],z>` for all rows.
+///
+/// `z` layout: `[private_vars(0..num_vars-1) | 1 | public_io(0..num_inputs-1)]`.
+///
+/// Used by the verifier to confirm the forward-solved witness for C* actually
+/// satisfies every constraint. Combined with triangularizability (enforced by
+/// [`solve_witness_forward`]), a self-consistent assignment implies C* has a
+/// unique witness per input — i.e. C* is a function — independent of π*.
+pub fn satisfies(instance: &SpartanInstance, vars: &[Scalar], public_io: &[Scalar]) -> bool {
+    if validate_instance(instance).is_err() {
+        return false;
+    }
+    if vars.len() != instance.num_vars || public_io.len() != instance.num_inputs {
+        return false;
+    }
+    let (a_rows, b_rows, c_rows) = build_row_views(instance);
+
+    let mut z = vec![Scalar::ZERO; instance.num_vars + 1 + instance.num_inputs];
+    z[..instance.num_vars].copy_from_slice(vars);
+    z[instance.num_vars] = Scalar::ONE;
+    z[instance.num_vars + 1..].copy_from_slice(public_io);
+
+    for row in 0..instance.num_cons {
+        if dot(&a_rows[row], &z) * dot(&b_rows[row], &z) != dot(&c_rows[row], &z) {
+            return false;
+        }
+    }
+    true
 }
